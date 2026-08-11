@@ -1,0 +1,689 @@
+import React, { useState, useEffect, useCallback, useRef } from "react";
+
+// ---------------------------------------------------------------------------
+// Threadline — decisions, tracked.
+// A single-file React app: capture decisions from raw meeting text, track
+// them on a literal "thread" timeline, and recall the reasoning behind any
+// past call in plain language.
+// ---------------------------------------------------------------------------
+
+const FONT_LINK_ID = "threadline-fonts";
+
+function useFonts() {
+  useEffect(() => {
+    if (document.getElementById(FONT_LINK_ID)) return;
+    const link = document.createElement("link");
+    link.id = FONT_LINK_ID;
+    link.rel = "stylesheet";
+    link.href =
+      "https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap";
+    document.head.appendChild(link);
+  }, []);
+}
+
+const STORAGE_KEY = "threadline:decisions";
+const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+const todayISO = () => new Date().toISOString().slice(0, 10);
+
+function statusOf(d) {
+  if (d.resolved) return "resolved";
+  if (d.deadline && d.deadline < todayISO()) return "overdue";
+  return "pending";
+}
+
+const STATUS_META = {
+  pending: { label: "Pending", color: "var(--pending)" },
+  overdue: { label: "Overdue", color: "var(--overdue)" },
+  resolved: { label: "Resolved", color: "var(--resolved)" },
+};
+
+async function callClaude(system, userText, { json = false } = {}) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1000,
+      system,
+      messages: [{ role: "user", content: userText }],
+    }),
+  });
+  if (!res.ok) throw new Error(`API error ${res.status}`);
+  const data = await res.json();
+  const text = (data.content || [])
+    .map((b) => (b.type === "text" ? b.text : ""))
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+  if (json) {
+    const cleaned = text.replace(/^```json\s*/i, "").replace(/```$/i, "").trim();
+    return JSON.parse(cleaned);
+  }
+  return text;
+}
+
+// ---------------------------------------------------------------------------
+
+function Spool({ size = 34 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 40 40" fill="none" aria-hidden="true">
+      <circle cx="20" cy="20" r="18" stroke="var(--thread)" strokeWidth="2" strokeDasharray="1 5" strokeLinecap="round" />
+      <circle cx="20" cy="20" r="10.5" fill="var(--thread)" opacity="0.15" />
+      <circle cx="20" cy="20" r="10.5" stroke="var(--thread)" strokeWidth="1.4" />
+      <circle cx="20" cy="20" r="3" fill="var(--thread)" />
+    </svg>
+  );
+}
+
+function TabButton({ id, label, active, onClick }) {
+  return (
+    <button
+      className={`tab-btn ${active ? "is-active" : ""}`}
+      onClick={() => onClick(id)}
+      aria-current={active ? "page" : undefined}
+    >
+      <span className="tab-num">{label.n}</span>
+      <span className="tab-label">{label.text}</span>
+    </button>
+  );
+}
+
+// ---------------------------------------------------------------------------
+
+function CaptureView({ onExtract, extracting, error, lastAdded }) {
+  const [text, setText] = useState("");
+  return (
+    <div className="view capture-view">
+      <header className="view-head">
+        <h1>Capture</h1>
+        <p>Paste meeting notes, a transcript, or a chat thread. Threadline pulls out what was actually decided.</p>
+      </header>
+      <textarea
+        className="capture-box"
+        placeholder={`e.g. "We agreed to delay the Q3 launch to October 14th because QA found blocking bugs. Priya owns the revised timeline."`}
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        rows={12}
+      />
+      <div className="capture-actions">
+        <button
+          className="btn-primary"
+          disabled={!text.trim() || extracting}
+          onClick={() => onExtract(text)}
+        >
+          {extracting ? "Reading the thread…" : "Extract decisions"}
+        </button>
+        {text.trim() && !extracting && (
+          <button className="btn-ghost" onClick={() => setText("")}>Clear</button>
+        )}
+      </div>
+      {error && <p className="error-line">{error}</p>}
+      {lastAdded != null && !error && !extracting && (
+        <p className="success-line">
+          {lastAdded === 0
+            ? "No concrete decisions found in that text — only open questions or actions without a call made."
+            : `Added ${lastAdded} decision${lastAdded === 1 ? "" : "s"} to the thread.`}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function DecisionCard({ d, onToggleResolved }) {
+  const status = statusOf(d);
+  const meta = STATUS_META[status];
+  return (
+    <div className="d-card" style={{ "--card-color": meta.color }}>
+      <div className="d-stitch" />
+      <div className="d-body">
+        <div className="d-top">
+          <span className="d-status">{meta.label}</span>
+          {d.deadline && <span className="d-deadline">{d.deadline}</span>}
+        </div>
+        <h3 className="d-title">{d.title}</h3>
+        <p className="d-reasoning">{d.reasoning}</p>
+        <div className="d-foot">
+          <span className="d-owner">{d.owner || "Unassigned"}</span>
+          <button className="d-resolve" onClick={() => onToggleResolved(d.id)}>
+            {d.resolved ? "Reopen" : "Mark resolved"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TrackView({ decisions, onToggleResolved }) {
+  const [filter, setFilter] = useState("all");
+  const sorted = [...decisions].sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+  const visible = filter === "all" ? sorted : sorted.filter((d) => statusOf(d) === filter);
+  const counts = { pending: 0, overdue: 0, resolved: 0 };
+  decisions.forEach((d) => counts[statusOf(d)]++);
+
+  return (
+    <div className="view track-view">
+      <header className="view-head">
+        <h1>Track</h1>
+        <p>Every decision on the thread, in the order it was made.</p>
+      </header>
+      <div className="filter-row">
+        {["all", "pending", "overdue", "resolved"].map((f) => (
+          <button
+            key={f}
+            className={`filter-chip ${filter === f ? "is-active" : ""}`}
+            onClick={() => setFilter(f)}
+            style={f !== "all" ? { "--chip-color": STATUS_META[f].color } : undefined}
+          >
+            {f === "all" ? `All (${decisions.length})` : `${STATUS_META[f].label} (${counts[f]})`}
+          </button>
+        ))}
+      </div>
+
+      {decisions.length === 0 ? (
+        <div className="empty-state">
+          <p>Nothing on the thread yet.</p>
+          <p className="empty-sub">Capture a meeting to start tracking decisions.</p>
+        </div>
+      ) : (
+        <div className="thread-rail">
+          <div className="thread-line" aria-hidden="true" />
+          {visible.map((d) => (
+            <DecisionCard key={d.id} d={d} onToggleResolved={onToggleResolved} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RecallView({ decisions }) {
+  const [query, setQuery] = useState("");
+  const [messages, setMessages] = useState([]); // {role, text}
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+  const scrollRef = useRef(null);
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [messages, loading]);
+
+  const ask = useCallback(async () => {
+    const q = query.trim();
+    if (!q || loading) return;
+    setErr(null);
+    setMessages((m) => [...m, { role: "user", text: q }]);
+    setQuery("");
+    setLoading(true);
+    try {
+      if (decisions.length === 0) {
+        setMessages((m) => [
+          ...m,
+          { role: "assistant", text: "There's nothing tracked on the thread yet, so I can't answer from records. Capture a meeting first." },
+        ]);
+        return;
+      }
+      const records = decisions.map((d) => ({
+        title: d.title,
+        owner: d.owner,
+        deadline: d.deadline,
+        reasoning: d.reasoning,
+        status: statusOf(d),
+        decidedOn: d.createdAt,
+      }));
+      const system =
+        "You answer questions about an organization's tracked decisions using ONLY the JSON decision records provided in the user message. Do not use outside knowledge or invent details. If the records don't cover the question, say plainly that there's no tracked decision for that. Name the specific decision title(s) you drew on. Keep the answer under 120 words, plain conversational prose, no markdown headers.";
+      const userMsg = `Decision records:\n${JSON.stringify(records, null, 2)}\n\nQuestion: ${q}`;
+      const answer = await callClaude(system, userMsg);
+      setMessages((m) => [...m, { role: "assistant", text: answer }]);
+    } catch (e) {
+      setErr("Couldn't reach the model. Try again.");
+    } finally {
+      setLoading(false);
+    }
+  }, [query, loading, decisions]);
+
+  return (
+    <div className="view recall-view">
+      <header className="view-head">
+        <h1>Recall</h1>
+        <p>Ask why a call was made. Answers come only from what's tracked on the thread.</p>
+      </header>
+      <div className="recall-log" ref={scrollRef}>
+        {messages.length === 0 && (
+          <div className="empty-state">
+            <p>Try: "Why did we push the launch date?"</p>
+            <p className="empty-sub">Or: "Who owns the pricing decision?"</p>
+          </div>
+        )}
+        {messages.map((m, i) => (
+          <div key={i} className={`bubble bubble-${m.role}`}>
+            {m.text}
+          </div>
+        ))}
+        {loading && <div className="bubble bubble-assistant is-typing">Checking the thread…</div>}
+      </div>
+      {err && <p className="error-line">{err}</p>}
+      <div className="recall-input-row">
+        <input
+          type="text"
+          value={query}
+          placeholder="Ask about a decision…"
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && ask()}
+        />
+        <button className="btn-primary" onClick={ask} disabled={!query.trim() || loading}>
+          Ask
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+
+export default function ThreadlineApp() {
+  useFonts();
+  const [tab, setTab] = useState("capture");
+  const [decisions, setDecisions] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [extracting, setExtracting] = useState(false);
+  const [captureError, setCaptureError] = useState(null);
+  const [lastAdded, setLastAdded] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get(STORAGE_KEY, true);
+        if (res && res.value) setDecisions(JSON.parse(res.value));
+      } catch (e) {
+        // no existing data yet
+      } finally {
+        setLoaded(true);
+      }
+    })();
+  }, []);
+
+  const persist = useCallback(async (next) => {
+    setDecisions(next);
+    try {
+      await window.storage.set(STORAGE_KEY, JSON.stringify(next), true);
+    } catch (e) {
+      console.error("Storage error", e);
+    }
+  }, []);
+
+  const handleExtract = useCallback(
+    async (text) => {
+      setExtracting(true);
+      setCaptureError(null);
+      setLastAdded(null);
+      try {
+        const system =
+          "You extract concrete decisions from meeting notes, transcripts, or chat threads. Return ONLY a raw JSON array, no markdown fences, no preamble. Each item: {\"title\": short imperative summary under 12 words, \"owner\": person or team name stated or clearly implied, else \"Unassigned\", \"deadline\": ISO date YYYY-MM-DD if a date is stated or unambiguously inferable, else null, \"reasoning\": one to two sentences on why, in your own words, not quoted}. Only include things the group actually decided or agreed to — not open questions, not action items with no decision behind them. Return [] if nothing qualifies.";
+        const items = await callClaude(system, text, { json: true });
+        const now = new Date().toISOString();
+        const withIds = (Array.isArray(items) ? items : []).map((it) => ({
+          id: uid(),
+          title: it.title || "Untitled decision",
+          owner: it.owner || "Unassigned",
+          deadline: it.deadline || null,
+          reasoning: it.reasoning || "",
+          resolved: false,
+          createdAt: now,
+        }));
+        await persist([...decisions, ...withIds]);
+        setLastAdded(withIds.length);
+        if (withIds.length > 0) setTab("track");
+      } catch (e) {
+        setCaptureError("Couldn't extract decisions from that text. Try again.");
+      } finally {
+        setExtracting(false);
+      }
+    },
+    [decisions, persist]
+  );
+
+  const toggleResolved = useCallback(
+    (id) => {
+      const next = decisions.map((d) => (d.id === id ? { ...d, resolved: !d.resolved } : d));
+      persist(next);
+    },
+    [decisions, persist]
+  );
+
+  const tabs = [
+    { id: "capture", n: "01", text: "Capture" },
+    { id: "track", n: "02", text: "Track" },
+    { id: "recall", n: "03", text: "Recall" },
+  ];
+
+  return (
+    <div className="tl-root">
+      <style>{CSS}</style>
+      <aside className="tl-side">
+        <div className="tl-brand">
+          <Spool />
+          <span className="tl-brand-name">Threadline</span>
+        </div>
+        <nav className="tl-nav">
+          {tabs.map((t) => (
+            <TabButton key={t.id} id={t.id} label={t} active={tab === t.id} onClick={setTab} />
+          ))}
+        </nav>
+        <div className="tl-side-foot">
+          <span>{decisions.length} tracked</span>
+          <span className="dot-sep">·</span>
+          <span>{decisions.filter((d) => statusOf(d) === "overdue").length} overdue</span>
+        </div>
+      </aside>
+      <main className="tl-main">
+        {!loaded ? (
+          <div className="empty-state" style={{ marginTop: 80 }}>
+            <p>Loading the thread…</p>
+          </div>
+        ) : tab === "capture" ? (
+          <CaptureView
+            onExtract={handleExtract}
+            extracting={extracting}
+            error={captureError}
+            lastAdded={lastAdded}
+          />
+        ) : tab === "track" ? (
+          <TrackView decisions={decisions} onToggleResolved={toggleResolved} />
+        ) : (
+          <RecallView decisions={decisions} />
+        )}
+      </main>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+
+const CSS = `
+:root {
+  --ink-950: #13151b;
+  --ink-900: #181b22;
+  --ink-800: #1e222b;
+  --ink-700: #2a2f3a;
+  --ink-600: #3a4050;
+  --text-hi: #ece9e1;
+  --text-lo: #8c90a0;
+  --text-faint: #5d6172;
+  --thread: #d6a13f;
+  --pending: #d6a13f;
+  --overdue: #e0654a;
+  --resolved: #5aab7d;
+}
+
+.tl-root {
+  display: flex;
+  min-height: 100%;
+  width: 100%;
+  background: var(--ink-950);
+  color: var(--text-hi);
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+}
+
+.tl-side {
+  width: 208px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--ink-700);
+  display: flex;
+  flex-direction: column;
+  padding: 28px 18px;
+  background: var(--ink-900);
+}
+
+.tl-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 40px;
+  padding-left: 4px;
+}
+.tl-brand-name {
+  font-family: 'Fraunces', serif;
+  font-size: 19px;
+  font-weight: 500;
+  letter-spacing: 0.2px;
+}
+
+.tl-nav { display: flex; flex-direction: column; gap: 4px; flex: 1; }
+
+.tab-btn {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  background: none;
+  border: none;
+  color: var(--text-lo);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 13px;
+  text-align: left;
+  padding: 11px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.tab-btn:hover { background: var(--ink-800); color: var(--text-hi); }
+.tab-btn.is-active { background: var(--ink-800); color: var(--text-hi); }
+.tab-btn.is-active .tab-num { color: var(--thread); }
+.tab-num { color: var(--text-faint); font-size: 12px; }
+.tab-label { font-family: 'IBM Plex Sans', sans-serif; font-size: 14.5px; font-weight: 500; }
+
+.tl-side-foot {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  padding-left: 4px;
+  display: flex;
+  gap: 6px;
+}
+.dot-sep { color: var(--text-faint); }
+
+.tl-main {
+  flex: 1;
+  padding: 44px 56px 60px;
+  overflow-y: auto;
+  min-width: 0;
+}
+
+.view { max-width: 640px; }
+.view-head { margin-bottom: 28px; }
+.view-head h1 {
+  font-family: 'Fraunces', serif;
+  font-weight: 500;
+  font-size: 34px;
+  margin: 0 0 8px;
+  letter-spacing: 0.1px;
+}
+.view-head p { color: var(--text-lo); font-size: 15px; line-height: 1.5; margin: 0; max-width: 480px; }
+
+/* Capture */
+.capture-box {
+  width: 100%;
+  background: var(--ink-900);
+  border: 1px solid var(--ink-700);
+  border-radius: 10px;
+  color: var(--text-hi);
+  font-family: 'IBM Plex Sans', sans-serif;
+  font-size: 14.5px;
+  line-height: 1.6;
+  padding: 16px 18px;
+  resize: vertical;
+  box-sizing: border-box;
+}
+.capture-box::placeholder { color: var(--text-faint); }
+.capture-box:focus { outline: none; border-color: var(--thread); }
+
+.capture-actions { display: flex; gap: 12px; margin-top: 16px; align-items: center; }
+
+.btn-primary {
+  background: var(--thread);
+  color: var(--ink-950);
+  border: none;
+  font-family: 'IBM Plex Sans', sans-serif;
+  font-weight: 600;
+  font-size: 14px;
+  padding: 11px 20px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: filter 0.15s ease, transform 0.1s ease;
+}
+.btn-primary:hover:not(:disabled) { filter: brightness(1.08); }
+.btn-primary:active:not(:disabled) { transform: scale(0.98); }
+.btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.btn-ghost {
+  background: none;
+  border: 1px solid var(--ink-700);
+  color: var(--text-lo);
+  font-size: 13.5px;
+  padding: 10px 16px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.btn-ghost:hover { color: var(--text-hi); border-color: var(--ink-600); }
+
+.error-line { color: var(--overdue); font-size: 13.5px; margin-top: 14px; }
+.success-line { color: var(--resolved); font-size: 13.5px; margin-top: 14px; }
+
+/* Track */
+.filter-row { display: flex; gap: 8px; margin-bottom: 26px; flex-wrap: wrap; }
+.filter-chip {
+  background: var(--ink-900);
+  border: 1px solid var(--ink-700);
+  color: var(--text-lo);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 12px;
+  padding: 7px 13px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.filter-chip.is-active {
+  color: var(--text-hi);
+  border-color: var(--chip-color, var(--thread));
+  background: var(--ink-800);
+}
+
+.thread-rail { position: relative; padding-left: 26px; }
+.thread-line {
+  position: absolute;
+  left: 5px;
+  top: 6px;
+  bottom: 6px;
+  width: 1.5px;
+  background: repeating-linear-gradient(to bottom, var(--ink-600) 0 5px, transparent 5px 10px);
+}
+
+.d-card { position: relative; display: flex; margin-bottom: 18px; }
+.d-stitch {
+  position: absolute;
+  left: -26px;
+  top: 22px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--card-color);
+  box-shadow: 0 0 0 4px var(--ink-950);
+}
+.d-body {
+  flex: 1;
+  background: var(--ink-900);
+  border: 1px solid var(--ink-700);
+  border-left: 2.5px solid var(--card-color);
+  border-radius: 10px;
+  padding: 16px 18px;
+}
+.d-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.d-status {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--card-color);
+}
+.d-deadline { font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--text-faint); }
+.d-title { font-family: 'Fraunces', serif; font-size: 18.5px; font-weight: 500; margin: 0 0 6px; line-height: 1.3; }
+.d-reasoning { color: var(--text-lo); font-size: 13.8px; line-height: 1.55; margin: 0 0 12px; }
+.d-foot { display: flex; justify-content: space-between; align-items: center; }
+.d-owner {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 12px;
+  color: var(--text-hi);
+  background: var(--ink-800);
+  padding: 4px 9px;
+  border-radius: 6px;
+}
+.d-resolve {
+  background: none;
+  border: none;
+  color: var(--text-faint);
+  font-size: 12.5px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.d-resolve:hover { color: var(--text-hi); }
+
+.empty-state { color: var(--text-lo); font-size: 14.5px; padding: 20px 0; }
+.empty-sub { color: var(--text-faint); font-size: 13px; margin-top: 4px; }
+
+/* Recall */
+.recall-log {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 220px;
+  max-height: 46vh;
+  overflow-y: auto;
+  padding: 4px 2px 16px;
+  margin-bottom: 14px;
+}
+.bubble {
+  max-width: 88%;
+  padding: 12px 15px;
+  border-radius: 12px;
+  font-size: 14.5px;
+  line-height: 1.55;
+}
+.bubble-user {
+  align-self: flex-end;
+  background: var(--thread);
+  color: var(--ink-950);
+  font-weight: 500;
+  border-bottom-right-radius: 3px;
+}
+.bubble-assistant {
+  align-self: flex-start;
+  background: var(--ink-900);
+  border: 1px solid var(--ink-700);
+  color: var(--text-hi);
+  border-bottom-left-radius: 3px;
+}
+.bubble.is-typing { color: var(--text-faint); font-style: italic; }
+
+.recall-input-row { display: flex; gap: 10px; }
+.recall-input-row input {
+  flex: 1;
+  background: var(--ink-900);
+  border: 1px solid var(--ink-700);
+  border-radius: 999px;
+  color: var(--text-hi);
+  font-family: 'IBM Plex Sans', sans-serif;
+  font-size: 14px;
+  padding: 11px 18px;
+}
+.recall-input-row input::placeholder { color: var(--text-faint); }
+.recall-input-row input:focus { outline: none; border-color: var(--thread); }
+
+@media (max-width: 760px) {
+  .tl-root { flex-direction: column; }
+  .tl-side { width: 100%; flex-direction: row; align-items: center; padding: 16px; border-right: none; border-bottom: 1px solid var(--ink-700); }
+  .tl-brand { margin-bottom: 0; }
+  .tl-nav { flex-direction: row; flex: none; margin-left: 20px; }
+  .tl-side-foot { display: none; }
+  .tl-main { padding: 28px 20px 40px; }
+}
+`;
