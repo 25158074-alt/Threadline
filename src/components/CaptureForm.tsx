@@ -49,7 +49,7 @@ export default function CaptureForm({
           <h2 className="text-lg font-semibold text-slate-900">Capture a meeting</h2>
         </div>
         <p className="text-sm text-slate-500">
-          Paste any meeting notes, transcript, or chat thread. Threadline extracts every decision, owner, deadline, and reason in your browser.
+          Paste any meeting notes, transcript, or chat thread. Threadline&rsquo;s AI extracts every decision, owner, deadline, and reason — automatically.
         </p>
       </div>
 

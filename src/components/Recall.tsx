@@ -46,7 +46,7 @@ export default function Recall() {
       </div>
       <p className="mt-1 text-sm text-slate-500">
         Ask <em>why did we decide X?</em> in plain language. Threadline answers from the
-        decisions saved in this browser.
+        actual tracked decisions — your institutional memory, searchable.
       </p>
 
       <form
